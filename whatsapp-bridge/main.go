@@ -5996,6 +5996,47 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 	}, nil
 }
 
+// Full app-state refetch after a hash mismatch, at most once per collection
+// per appStateResyncGap.
+//
+// whatsmeow only full-syncs app state on the first connect after pairing; every
+// later fetch is incremental from the version stored in the session. When a
+// patch fails its LTHash check that stored state has drifted from WhatsApp's,
+// and each later notification restarts from it and fails on the same patch —
+// so archive / pin / mute / read markers / labels for that collection stop
+// updating until a re-pair (seen on prod Oct 2026: one line failed 10 times in
+// 15 minutes). A fullSync fetch drops the stored state and takes a fresh
+// snapshot from the server. Server-only: no request to the phone, no history
+// sync, nothing shown on the device.
+const appStateResyncGap = time.Hour
+
+var appStateResync = struct {
+	sync.Mutex
+	last map[appstate.WAPatchName]time.Time
+}{last: map[appstate.WAPatchName]time.Time{}}
+
+func resyncAppStateCollection(client *whatsmeow.Client, name appstate.WAPatchName) {
+	appStateResync.Lock()
+	if last, ok := appStateResync.last[name]; ok && time.Since(last) < appStateResyncGap {
+		appStateResync.Unlock()
+		return
+	}
+	appStateResync.last[name] = time.Now()
+	appStateResync.Unlock()
+
+	// whatsmeow dispatches AppStateSyncError while still holding its app-state
+	// lock, so the refetch has to wait in its own goroutine — run inline it
+	// would deadlock.
+	go func() {
+		slog.Warn("app state hash mismatch; refetching collection from a fresh snapshot", "patch", string(name))
+		if err := client.FetchAppState(context.Background(), name, true, false); err != nil {
+			slog.Error("app state full refetch failed", "patch", string(name), "err", err)
+			return
+		}
+		slog.Info("app state collection refetched", "patch", string(name))
+	}()
+}
+
 func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -6216,6 +6257,13 @@ func main() {
 			labeled := v.Action != nil && v.Action.GetLabeled()
 			if err := messageStore.SetWaChatLabel(chatJID, v.LabelID, labeled); err != nil {
 				logger.Warnf("Failed to set WA chat label %s on %s: %v", v.LabelID, chatJID, err)
+			}
+
+		case *events.AppStateSyncError:
+			// Only an incremental fetch that hit a hash mismatch. A failed full
+			// fetch is not retried from here, so this can never loop on itself.
+			if !v.FullSync && errors.Is(v.Error, appstate.ErrMismatchingLTHash) {
+				resyncAppStateCollection(client, v.Name)
 			}
 
 		case *events.MediaRetry:
