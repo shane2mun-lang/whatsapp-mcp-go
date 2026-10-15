@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -409,6 +410,15 @@ func NewMessageStore() (*MessageStore, error) {
 	} else {
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN failed_at TIMESTAMP`)
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN failure_reason TEXT`)
+	}
+
+	// The media's own CDN path from the message (or a media retry's re-upload
+	// path once it has been verified to decrypt). Downloads use it before a path
+	// derived from url, which can carry an earlier upload's expired token.
+	if isPostgres {
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS direct_path TEXT`)
+	} else {
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN direct_path TEXT`)
 	}
 
 	return &MessageStore{db: db}, nil
@@ -1072,7 +1082,7 @@ func (store *MessageStore) OldestMessage(chatJID string) (id string, isFromMe bo
 
 // StoreMessage Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	mediaType, filename, url, directPath string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
 	quotedID, quotedSender, quotedContent string, isForwarded bool) error {
 	if content == "" && mediaType == "" {
 		return nil
@@ -1083,17 +1093,21 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	if !isPostgres {
 		_, err := store.db.Exec(
 			`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender, quoted_content, is_forwarded)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender, quoted_content, is_forwarded, direct_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
 		)
 		return err
 	}
+	// direct_path keeps the stored value on a re-store: it is either the same
+	// path from the same message, or a retry re-upload path that was verified
+	// to decrypt and is fresher than the message's original.
 	_, err := store.db.Exec(
 		`INSERT INTO messages
-    (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender, quoted_content, is_forwarded)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+    (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender, quoted_content, is_forwarded, direct_path)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
     ON CONFLICT(id, chat_jid) DO UPDATE SET
+    direct_path = COALESCE(messages.direct_path, EXCLUDED.direct_path),
     chat_jid = EXCLUDED.chat_jid,
     sender = EXCLUDED.sender,
     content = EXCLUDED.content,
@@ -1110,7 +1124,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
     quoted_sender = COALESCE(EXCLUDED.quoted_sender, messages.quoted_sender),
     quoted_content = COALESCE(EXCLUDED.quoted_content, messages.quoted_content),
     is_forwarded = messages.is_forwarded OR EXCLUDED.is_forwarded`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
 	)
 
 	return err
@@ -1430,7 +1444,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// Captured from the media upload below so the sent message can be persisted
 	// to our own store (WhatsApp never echoes a message back to the device that
 	// sent it, so without this the send vanishes from the chat view on reload).
-	var stMediaType, stFilename, stURL string
+	var stMediaType, stFilename, stURL, stDirectPath string
 	var stMediaKey, stFileSHA, stFileEncSHA []byte
 	var stFileLen uint64
 
@@ -1601,6 +1615,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 		stFilename = mediaFilename
 		stURL = resp.URL
+		stDirectPath = resp.DirectPath
 		stMediaKey = resp.MediaKey
 		stFileSHA = resp.FileSHA256
 		stFileEncSHA = resp.FileEncSHA256
@@ -1671,7 +1686,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 		if storeErr := messageStore.StoreMessage(
 			sendResp.ID, chatJID, sender, message, sentAt, true,
-			stMediaType, stFilename, stURL, stMediaKey, stFileSHA, stFileEncSHA, stFileLen,
+			stMediaType, stFilename, stURL, stDirectPath, stMediaKey, stFileSHA, stFileEncSHA, stFileLen,
 			quotedID, quotedParticipant, quotedText, isForwarded,
 		); storeErr != nil {
 			slog.Warn("failed to store sent message", "error", storeErr)
@@ -1910,6 +1925,29 @@ func extractMediaInfo(msg *waE2E.Message) (mediaType string, filename string, ur
 	}
 
 	return "", "", "", nil, nil, nil, 0
+}
+
+// mediaDirectPath returns the media's own CDN path from the message. Downloads
+// prefer it over a path derived from the URL: for forwarded or re-sent media the
+// URL can still carry an earlier upload's expired token (403) while the direct
+// path is current. Same message shapes as extractMediaInfo.
+func mediaDirectPath(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetDirectPath()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetDirectPath()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetDirectPath()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetDirectPath()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetDirectPath()
+	}
+	return ""
 }
 
 // unwrapMessage peels ephemeral / view-once / device-sent wrappers to reach the
@@ -2379,6 +2417,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		mediaType,
 		filename,
 		url,
+		mediaDirectPath(msg.Message),
 		mediaKey,
 		fileSHA256,
 		fileEncSHA256,
@@ -2544,14 +2583,28 @@ func (store *MessageStore) GetMessageSourceInfo(id, chatJID string) (string, boo
 	return sender, isFromMe, err
 }
 
-// UpdateMediaURL replaces a stored message's media URL — used when a media
-// retry response delivers a fresh direct path after the CDN copy expired.
-func (store *MessageStore) UpdateMediaURL(id, chatJID, url string) error {
-	q := "UPDATE messages SET url = ? WHERE id = ? AND chat_jid = ?"
+// GetMediaDirectPath returns the stored direct path, or "" when the message
+// predates the column or carried none.
+func (store *MessageStore) GetMediaDirectPath(id, chatJID string) string {
+	q := "SELECT COALESCE(direct_path, '') FROM messages WHERE id = ? AND chat_jid = ?"
 	if isPostgres {
-		q = "UPDATE messages SET url = $1 WHERE id = $2 AND chat_jid = $3"
+		q = "SELECT COALESCE(direct_path, '') FROM messages WHERE id = $1 AND chat_jid = $2"
 	}
-	_, err := store.db.Exec(q, url, id, chatJID)
+	var path string
+	_ = store.db.QueryRow(q, id, chatJID).Scan(&path)
+	return path
+}
+
+// SetMediaDirectPath stores a media retry's re-upload path. Callers must have
+// downloaded and decrypted the media from it first: a re-upload that does not
+// match the message's media key would otherwise replace a working path with
+// one that fails every download. url is left untouched.
+func (store *MessageStore) SetMediaDirectPath(id, chatJID, path string) error {
+	q := "UPDATE messages SET direct_path = ? WHERE id = ? AND chat_jid = ?"
+	if isPostgres {
+		q = "UPDATE messages SET direct_path = $1 WHERE id = $2 AND chat_jid = $3"
+	}
+	_, err := store.db.Exec(q, path, id, chatJID)
 	return err
 }
 
@@ -2650,33 +2703,28 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return true, mediaType, filename, absPath, nil
 	}
 
-	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
+	// Candidate CDN paths, best first: the stored direct path (the message's own,
+	// or a verified retry re-upload), then the one derived from url.
+	var paths []string
+	for _, p := range []string{messageStore.GetMediaDirectPath(messageID, chatJID), urlDirectPath(url)} {
+		if p != "" && !slices.Contains(paths, p) {
+			paths = append(paths, p)
+		}
+	}
+
+	if len(paths) == 0 || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
 	slog.Info("attempting to download media", "message_id", messageID, "chat_jid", chatJID)
 
-	directPath := extractDirectPathFromURL(url)
-
-	var waMediaType whatsmeow.MediaType
-	switch mediaType {
-	case "image":
-		waMediaType = whatsmeow.MediaImage
-	case "video":
-		waMediaType = whatsmeow.MediaVideo
-	case "audio":
-		waMediaType = whatsmeow.MediaAudio
-	case "sticker":
-		waMediaType = whatsmeow.MediaImage
-	case "document":
-		waMediaType = whatsmeow.MediaDocument
-	default:
+	waMediaType, ok := waMediaTypeFor(mediaType)
+	if !ok {
 		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
 	}
 
 	downloader := &MediaDownloader{
 		URL:           url,
-		DirectPath:    directPath,
 		MediaKey:      mediaKey,
 		FileLength:    fileLength,
 		FileSHA256:    fileSHA256,
@@ -2684,12 +2732,21 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	mediaData, err := client.Download(context.Background(), downloader)
+	var mediaData []byte
+	expired := false
+	for _, p := range paths {
+		downloader.DirectPath = p
+		mediaData, err = client.Download(context.Background(), downloader)
+		if err == nil {
+			break
+		}
+		expired = expired || isExpiredMediaErr(err)
+	}
 	if err != nil {
 		// 403/404/410 mean the encrypted blob has expired off WhatsApp's CDN.
 		// Ask the sender's device to re-upload it (silent protocol receipt) and
 		// retry from the fresh direct path before giving up.
-		if isExpiredMediaErr(err) {
+		if expired {
 			mediaData, err = retryExpiredMedia(client, messageStore, messageID, chatJID, downloader)
 		}
 		if err != nil {
@@ -2797,7 +2854,16 @@ func performMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, mes
 		data, dlErr := client.DownloadMediaWithPath(context.Background(),
 			notif.GetDirectPath(), d.FileEncSHA256, d.FileSHA256, d.MediaKey, d.MediaType, "", false)
 		if dlErr != nil {
+			// Not persisted: a re-upload that fails here (typically a ciphertext
+			// that does not match this message's media key) must not replace the
+			// stored path, or every later download fails on it for good.
 			return nil, fmt.Errorf("re-download after media retry failed: %v", dlErr)
+		}
+		// Downloaded and decrypted, so the path is known good — keep it for
+		// later downloads.
+		if err := messageStore.SetMediaDirectPath(messageID, chatJID, notif.GetDirectPath()); err != nil {
+			slog.Warn("failed to persist re-uploaded media path",
+				"message_id", messageID, "chat_jid", chatJID, "error", err)
 		}
 		slog.Info("media retry succeeded; downloaded re-uploaded media",
 			"message_id", messageID, "bytes", len(data))
@@ -2808,10 +2874,10 @@ func performMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, mes
 }
 
 // handleMediaRetryResponse processes a sender's answer to a media retry
-// receipt. It hands the event to the download request waiting on it (if any),
-// and independently persists the fresh direct path into the message row — so
-// an answer that arrives after the waiter timed out isn't lost: the next
-// download attempt uses the refreshed path and succeeds without a new
+// receipt. A download request waiting on it gets the event and persists the
+// path itself once it has decrypted the media. An answer that arrives after the
+// waiter timed out is checked here the same way — downloaded and decrypted —
+// and only then persisted, so the next download uses it without a new
 // round-trip to the sender's device.
 func handleMediaRetryResponse(client *whatsmeow.Client, messageStore *MessageStore, evt *events.MediaRetry) {
 	msgID := string(evt.MessageID)
@@ -2820,24 +2886,58 @@ func handleMediaRetryResponse(client *whatsmeow.Client, messageStore *MessageSto
 		case w.(*mediaRetryWaiter).ch <- evt:
 		default:
 		}
+		return
 	}
 
 	chatJID := normalizeUserJID(client, evt.ChatID).String()
-	_, _, _, mediaKey, _, _, _, err := messageStore.GetMediaInfo(msgID, chatJID)
+	mediaType, _, _, mediaKey, fileSHA256, fileEncSHA256, _, err := messageStore.GetMediaInfo(msgID, chatJID)
 	if err != nil || len(mediaKey) == 0 {
+		return
+	}
+	waType, ok := waMediaTypeFor(mediaType)
+	if !ok {
 		return
 	}
 	notif, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
 	if err != nil || notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
 		return
 	}
-	if err := messageStore.UpdateMediaURL(msgID, chatJID, notif.GetDirectPath()); err != nil {
+	if _, err := client.DownloadMediaWithPath(context.Background(),
+		notif.GetDirectPath(), fileEncSHA256, fileSHA256, mediaKey, waType, "", false); err != nil {
+		slog.Warn("late media retry response does not decrypt; keeping the stored path",
+			"message_id", msgID, "chat_jid", chatJID, "error", err)
+		return
+	}
+	if err := messageStore.SetMediaDirectPath(msgID, chatJID, notif.GetDirectPath()); err != nil {
 		slog.Warn("failed to persist refreshed media path from retry response",
 			"message_id", msgID, "chat_jid", chatJID, "error", err)
 		return
 	}
 	slog.Info("persisted refreshed media path from retry response",
 		"message_id", msgID, "chat_jid", chatJID)
+}
+
+// waMediaTypeFor maps a stored media_type to whatsmeow's download key type.
+func waMediaTypeFor(mediaType string) (whatsmeow.MediaType, bool) {
+	switch mediaType {
+	case "image", "sticker":
+		return whatsmeow.MediaImage, true
+	case "video":
+		return whatsmeow.MediaVideo, true
+	case "audio":
+		return whatsmeow.MediaAudio, true
+	case "document":
+		return whatsmeow.MediaDocument, true
+	}
+	return "", false
+}
+
+// urlDirectPath is extractDirectPathFromURL for a possibly empty url.
+func urlDirectPath(url string) string {
+	if url == "" {
+		return ""
+	}
+	return extractDirectPathFromURL(url)
 }
 
 func extractDirectPathFromURL(url string) string {
@@ -4625,12 +4725,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					content = captionOf(msg.Message.Message)
 				}
 
-				var mediaType, filename, url string
+				var mediaType, filename, url, directPath string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
 				var fileLength uint64
 
 				if msg.Message.Message != nil {
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					directPath = mediaDirectPath(msg.Message.Message)
 				}
 
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
@@ -4708,6 +4809,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType,
 					filename,
 					url,
+					directPath,
 					mediaKey,
 					fileSHA256,
 					fileEncSHA256,
