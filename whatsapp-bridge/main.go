@@ -2736,7 +2736,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	expired := false
 	for _, p := range paths {
 		downloader.DirectPath = p
-		mediaData, err = client.Download(context.Background(), downloader)
+		var keyType whatsmeow.MediaType
+		mediaData, keyType, err = downloadWithKeyFallback(waMediaType, func(t whatsmeow.MediaType) ([]byte, error) {
+			downloader.MediaType = t
+			return client.Download(context.Background(), downloader)
+		})
+		downloader.MediaType = keyType
 		if err == nil {
 			break
 		}
@@ -2758,7 +2763,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	slog.Info("successfully downloaded media", "media_type", mediaType, "path", absPath, "bytes", len(mediaData))
+	slog.Info("successfully downloaded media", "media_type", mediaType, "key_type", downloader.MediaType, "path", absPath, "bytes", len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 
@@ -2851,8 +2856,10 @@ func performMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, mes
 		if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
 			return nil, fmt.Errorf("media expired and the sender's device could not re-upload it (result: %s)", notif.GetResult())
 		}
-		data, dlErr := client.DownloadMediaWithPath(context.Background(),
-			notif.GetDirectPath(), d.FileEncSHA256, d.FileSHA256, d.MediaKey, d.MediaType, "", false)
+		data, _, dlErr := downloadWithKeyFallback(d.MediaType, func(t whatsmeow.MediaType) ([]byte, error) {
+			return client.DownloadMediaWithPath(context.Background(),
+				notif.GetDirectPath(), d.FileEncSHA256, d.FileSHA256, d.MediaKey, t, "", false)
+		})
 		if dlErr != nil {
 			// Not persisted: a re-upload that fails here (typically a ciphertext
 			// that does not match this message's media key) must not replace the
@@ -2902,8 +2909,10 @@ func handleMediaRetryResponse(client *whatsmeow.Client, messageStore *MessageSto
 	if err != nil || notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
 		return
 	}
-	if _, err := client.DownloadMediaWithPath(context.Background(),
-		notif.GetDirectPath(), fileEncSHA256, fileSHA256, mediaKey, waType, "", false); err != nil {
+	if _, _, err := downloadWithKeyFallback(waType, func(t whatsmeow.MediaType) ([]byte, error) {
+		return client.DownloadMediaWithPath(context.Background(),
+			notif.GetDirectPath(), fileEncSHA256, fileSHA256, mediaKey, t, "", false)
+	}); err != nil {
 		slog.Warn("late media retry response does not decrypt; keeping the stored path",
 			"message_id", msgID, "chat_jid", chatJID, "error", err)
 		return
@@ -2930,6 +2939,25 @@ func waMediaTypeFor(mediaType string) (whatsmeow.MediaType, bool) {
 		return whatsmeow.MediaDocument, true
 	}
 	return "", false
+}
+
+// downloadWithKeyFallback runs download with mediaType's keys and returns the
+// key type that worked. WhatsApp Web/Desktop sometimes sends a photo as a
+// documentMessage (mimetype image/*) while uploading and encrypting it as an
+// image — such media sits under the /o1/v/... CDN path class rather than the
+// document class t62.7119 — so the ciphertext is genuine but the
+// "WhatsApp Document Keys" expansion fails the HMAC check every time. A document
+// that fails its HMAC is retried with image keys; if that fails too, the
+// original error is returned.
+func downloadWithKeyFallback(mediaType whatsmeow.MediaType, download func(whatsmeow.MediaType) ([]byte, error)) ([]byte, whatsmeow.MediaType, error) {
+	data, err := download(mediaType)
+	if err == nil || mediaType != whatsmeow.MediaDocument || !errors.Is(err, whatsmeow.ErrInvalidMediaHMAC) {
+		return data, mediaType, err
+	}
+	if data, imgErr := download(whatsmeow.MediaImage); imgErr == nil {
+		return data, whatsmeow.MediaImage, nil
+	}
+	return nil, mediaType, err
 }
 
 // urlDirectPath is extractDirectPathFromURL for a possibly empty url.
