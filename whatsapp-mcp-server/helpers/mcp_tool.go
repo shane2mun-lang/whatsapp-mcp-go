@@ -932,6 +932,11 @@ func mimeForFilename(filename string) string {
 	if mt, ok := documentMimeTypes[ext]; ok {
 		return mt
 	}
+	// The mime package says bare "audio/ogg"; WhatsApp drops voice notes that
+	// lack the codecs parameter.
+	if ext == ".ogg" || ext == ".opus" {
+		return "audio/ogg; codecs=opus"
+	}
 	if mt := mime.TypeByExtension(ext); mt != "" {
 		return mt
 	}

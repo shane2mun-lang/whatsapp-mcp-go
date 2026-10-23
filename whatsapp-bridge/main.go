@@ -1498,9 +1498,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			mediaType = whatsmeow.MediaImage
 			mimeType = "image/webp"
 
-		case "ogg":
+		case "ogg", "opus":
 			mediaType = whatsmeow.MediaAudio
-			mimeType = "audio/ogg; codecs=opus"
+			mimeType = voiceNoteMimetype
 
 		case "mp4":
 			mediaType = whatsmeow.MediaVideo
@@ -1530,6 +1530,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// documents, which otherwise default to octet-stream and won't open.
 		if mediaMimetype != "" {
 			mimeType = mediaMimetype
+		}
+		if mediaType == whatsmeow.MediaAudio {
+			mimeType = normalizeVoiceNoteMimetype(mimeType)
 		}
 
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
@@ -4990,6 +4993,21 @@ func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
 	} else {
 		slog.Info("history sync requested, waiting for server response")
 	}
+}
+
+// voiceNoteMimetype is the only label WhatsApp accepts for a PTT voice note.
+const voiceNoteMimetype = "audio/ogg; codecs=opus"
+
+// normalizeVoiceNoteMimetype restores the codecs parameter on Ogg/Opus labels.
+// Callers derive MIME from the extension (Go's mime package says bare
+// "audio/ogg"), and WhatsApp silently drops a voice note labelled that way.
+func normalizeVoiceNoteMimetype(mt string) string {
+	base := strings.ToLower(strings.TrimSpace(strings.Split(mt, ";")[0]))
+	switch base {
+	case "", "audio/ogg", "audio/opus", "application/ogg":
+		return voiceNoteMimetype
+	}
+	return mt
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
