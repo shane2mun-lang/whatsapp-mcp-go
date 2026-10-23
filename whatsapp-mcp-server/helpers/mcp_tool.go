@@ -115,8 +115,13 @@ func InitMcpTool() {
 
 	mcp.AddTool[addGroupParticipantsInput, any](server, &mcp.Tool{
 		Name:        "add_group_participants",
-		Description: "Add one or more participants (phone numbers, no +) to a WhatsApp group. Returns a per-participant result; an add can fail if the person's privacy settings block direct adds (then 'needs_invite' is set — share the invite link instead).",
+		Description: "Add one or more participants (phone numbers, no +) to a WhatsApp group. Returns a per-participant result; an add can fail if the person's privacy settings block direct adds (then 'needs_invite' is set — share the invite link instead). To give the new members the group's recent messages, call share_group_history right after.",
 	}, addGroupParticipantsHandler)
+
+	mcp.AddTool[groupParticipantsInput, any](server, &mcp.Tool{
+		Name:        "share_group_history",
+		Description: "Share a group's recent text messages (last 14 days, at most 100) with members who were just added, like WhatsApp's own \"send recent messages\": the history appears in their chat and the group sees a \"message history sent\" line. Call it right after add_group_participants, with the members that were added. Requires this number to be a group admin.",
+	}, shareGroupHistoryHandler)
 
 	mcp.AddTool[groupParticipantsInput, any](server, &mcp.Tool{
 		Name:        "remove_group_participants",
@@ -267,13 +272,13 @@ type groupParticipantsInput struct {
 	Participants []string `json:"participants" jsonschema:"description:Phone numbers (no +) or member JIDs to act on"`
 }
 
-// add_group_participants keeps the retired history-sharing fields so existing
-// callers still validate; asking for them reports the share as not sent.
+// add_group_participants keeps the old history-sharing fields so existing
+// callers still validate; sharing is now the separate share_group_history tool.
 type addGroupParticipantsInput struct {
 	Jid               string   `json:"jid" jsonschema:"description:The group JID like 123@g.us"`
 	Participants      []string `json:"participants" jsonschema:"description:Phone numbers (no +) or member JIDs to add"`
-	ShareHistory      bool     `json:"share_history,omitempty" jsonschema:"description:Disabled. History sharing on add is not available; setting this only reports history.ok=false."`
-	ShareHistoryCount int      `json:"share_history_count,omitempty" jsonschema:"description:Disabled. History sharing on add is not available; setting this only reports history.ok=false."`
+	ShareHistory      bool     `json:"share_history,omitempty" jsonschema:"description:Deprecated: use the share_group_history tool after adding. Setting this only reports history.ok=false."`
+	ShareHistoryCount int      `json:"share_history_count,omitempty" jsonschema:"description:Deprecated: use the share_group_history tool after adding. Setting this only reports history.ok=false."`
 }
 
 type setGroupNameInput struct {
@@ -1047,11 +1052,36 @@ func addGroupParticipantsHandler(ctx context.Context, req *mcp.CallToolRequest, 
 		return ErrResult("invalid update-participants response"), nil, nil
 	}
 
-	// History sharing on add is disabled: the bridge's old share sent a
-	// self-only HISTORY_SYNC_NOTIFICATION to other users, which WhatsApp
-	// answers by logging the number out (device_removed).
+	// Sharing is no longer chained to the add; it is share_group_history.
 	if in.ShareHistory || in.ShareHistoryCount > 0 {
-		result["history"] = map[string]any{"ok": false, "error": "history sharing is disabled"}
+		result["history"] = map[string]any{"ok": false, "error": "history sharing moved: call share_group_history after the add"}
+	}
+	return OkResult(result), nil, nil
+}
+
+// shareGroupHistoryHandler gives members who were just added the group's
+// recent messages through the bridge's native share (a group-direct history
+// bundle plus the group notice). Bridges built without it answer 410.
+func shareGroupHistoryHandler(ctx context.Context, req *mcp.CallToolRequest, in groupParticipantsInput) (*mcp.CallToolResult, any, error) {
+	if in.Jid == "" {
+		return ErrResult("jid is required"), nil, nil
+	}
+	if len(in.Participants) == 0 {
+		return ErrResult("at least one participant is required"), nil, nil
+	}
+	data, err := callAPI(http.MethodPost, "/group/share-history", map[string]any{
+		"jid":          in.Jid,
+		"participants": in.Participants,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "API error 410") {
+			return ErrResult("history sharing is not available on this number"), nil, nil
+		}
+		return ErrResult(err.Error()), nil, nil
+	}
+	var result map[string]any
+	if err := json.Unmarshal(data, &result); err != nil {
+		return ErrResult("invalid share-history response"), nil, nil
 	}
 	return OkResult(result), nil, nil
 }

@@ -3041,11 +3041,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 	})
 
-	// POST /api/group/share-history — retired. It sent a self-only
+	// POST /api/group/share-history. The old share sent a self-only
 	// HISTORY_SYNC_NOTIFICATION to other users, which WhatsApp answers by
-	// logging the number out (device_removed). Kept as 410 so old callers get
-	// a clear error instead of a 404.
+	// logging the number out (device_removed), so default builds answer 410.
+	// A -tags grouphistory build sets shareGroupHistoryHandler to the native
+	// share (grouphistory_send.go) for testing.
 	apiMux.HandleFunc("/group/share-history", func(w http.ResponseWriter, r *http.Request) {
+		if shareGroupHistoryHandler != nil {
+			shareGroupHistoryHandler(client, messageStore)(w, r)
+			return
+		}
 		respondError(w, http.StatusGone, "history sharing is disabled")
 	})
 
@@ -4335,6 +4340,10 @@ func parseParticipantJID(raw string) (types.JID, error) {
 	}
 	return types.NewJID(digits, types.DefaultUserServer), nil
 }
+
+// shareGroupHistoryHandler is nil unless the bridge is built with
+// -tags grouphistory (see grouphistory_send.go).
+var shareGroupHistoryHandler func(client *whatsmeow.Client, store *MessageStore) http.HandlerFunc
 
 func parseParticipantJIDs(raws []string) ([]types.JID, error) {
 	out := make([]types.JID, 0, len(raws))
