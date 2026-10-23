@@ -1,7 +1,6 @@
 package main
 
 import (
-	"compress/zlib"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -53,11 +52,9 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
-	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waMmsRetry"
-	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -1696,166 +1693,6 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	return true, fmt.Sprintf("Message sent to %s", recipient), sendResp.ID
 }
 
-// histRow is one stored message with the fields needed to rebuild a
-// WebMessageInfo for a history-sync bundle.
-type histRow struct {
-	ID        string
-	Sender    string
-	Content   string
-	Time      time.Time
-	IsFromMe  bool
-	MediaType string
-}
-
-// getHistoryRows returns the last `limit` messages of a chat (newest first),
-// including the message ID (GetMessages omits it).
-func (store *MessageStore) getHistoryRows(chatJID string, limit int) ([]histRow, error) {
-	q := "SELECT id, sender, content, timestamp, is_from_me, media_type FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?"
-	if isPostgres {
-		q = "SELECT id, sender, content, timestamp, is_from_me, media_type FROM messages WHERE chat_jid = $1 ORDER BY timestamp DESC LIMIT $2"
-	}
-	rows, err := store.db.Query(q, chatJID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []histRow
-	for rows.Next() {
-		var r histRow
-		var ts time.Time
-		var sender, content, mediaType sql.NullString
-		if err := rows.Scan(&r.ID, &sender, &content, &ts, &r.IsFromMe, &mediaType); err != nil {
-			return nil, err
-		}
-		r.Sender = sender.String
-		r.Content = content.String
-		r.MediaType = mediaType.String
-		r.Time = ts
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// shareGroupHistory builds a RECENT history-sync bundle of the last `count`
-// messages in gjid and sends it as an (invisible) HistorySyncNotification to
-// each member — WhatsApp's "share message history with new member" mechanism, so
-// the history appears for the newcomer without posting anything into the group.
-// Text only; media is rendered as a "[type]" placeholder.
-func shareGroupHistory(client *whatsmeow.Client, store *MessageStore, gjid types.JID, members []types.JID, count int) error {
-	if store == nil {
-		return fmt.Errorf("no message store")
-	}
-	if count <= 0 || count > 100 {
-		count = 50
-	}
-	rows, err := store.getHistoryRows(gjid.String(), count)
-	if err != nil {
-		return fmt.Errorf("read messages: %w", err)
-	}
-	if len(rows) == 0 {
-		return fmt.Errorf("no messages to share")
-	}
-	// Newest-first → chronological.
-	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
-		rows[i], rows[j] = rows[j], rows[i]
-	}
-
-	var ownJID string
-	if client.Store.ID != nil {
-		ownJID = client.Store.ID.ToNonAD().String()
-	}
-	isGroup := gjid.Server == types.GroupServer
-
-	hsMsgs := make([]*waHistorySync.HistorySyncMsg, 0, len(rows))
-	for idx, m := range rows {
-		body := m.Content
-		if body == "" && m.MediaType != "" {
-			body = "[" + m.MediaType + "]"
-		}
-		if body == "" {
-			continue
-		}
-		participant := m.Sender
-		if m.IsFromMe || participant == "" {
-			participant = ownJID
-		} else if !strings.Contains(participant, "@") {
-			participant = participant + "@" + types.DefaultUserServer
-		}
-		key := &waCommon.MessageKey{
-			RemoteJID: proto.String(gjid.String()),
-			FromMe:    proto.Bool(m.IsFromMe),
-			ID:        proto.String(m.ID),
-		}
-		wmi := &waWeb.WebMessageInfo{
-			Key:              key,
-			Message:          &waE2E.Message{Conversation: proto.String(body)},
-			MessageTimestamp: proto.Uint64(uint64(m.Time.Unix())),
-			Status:           waWeb.WebMessageInfo_DELIVERY_ACK.Enum(),
-		}
-		if isGroup {
-			key.Participant = proto.String(participant)
-			wmi.Participant = proto.String(participant)
-		}
-		hsMsgs = append(hsMsgs, &waHistorySync.HistorySyncMsg{
-			Message:    wmi,
-			MsgOrderID: proto.Uint64(uint64(idx + 1)),
-		})
-	}
-	if len(hsMsgs) == 0 {
-		return fmt.Errorf("no shareable messages")
-	}
-
-	hs := &waHistorySync.HistorySync{
-		SyncType: waHistorySync.HistorySync_RECENT.Enum(),
-		Conversations: []*waHistorySync.Conversation{{
-			ID:       proto.String(gjid.String()),
-			Messages: hsMsgs,
-		}},
-		ChunkOrder: proto.Uint32(1),
-		Progress:   proto.Uint32(100),
-	}
-	raw, err := proto.Marshal(hs)
-	if err != nil {
-		return fmt.Errorf("marshal history sync: %w", err)
-	}
-	var buf bytes.Buffer
-	zw := zlib.NewWriter(&buf)
-	if _, err := zw.Write(raw); err != nil {
-		return fmt.Errorf("compress: %w", err)
-	}
-	if err := zw.Close(); err != nil {
-		return fmt.Errorf("compress close: %w", err)
-	}
-
-	up, err := client.Upload(context.Background(), buf.Bytes(), whatsmeow.MediaHistory)
-	if err != nil {
-		return fmt.Errorf("upload history: %w", err)
-	}
-
-	notif := &waE2E.Message{
-		ProtocolMessage: &waE2E.ProtocolMessage{
-			Type: waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION.Enum(),
-			HistorySyncNotification: &waE2E.HistorySyncNotification{
-				FileSHA256:    up.FileSHA256,
-				FileLength:    proto.Uint64(up.FileLength),
-				MediaKey:      up.MediaKey,
-				FileEncSHA256: up.FileEncSHA256,
-				DirectPath:    proto.String(up.DirectPath),
-				SyncType:      waE2E.HistorySyncType_RECENT.Enum(),
-				ChunkOrder:    proto.Uint32(1),
-			},
-		},
-	}
-	var sendErr error
-	for _, member := range members {
-		if _, err := client.SendMessage(context.Background(), member, notif); err != nil {
-			slog.Warn("failed to send history sync", "member", member.String(), "error", err)
-			sendErr = err
-		}
-	}
-	return sendErr
-}
-
 // Extract media info from a message
 // captionOf returns the caption of a media message (image/video/document).
 // extractTextContent only reads plain text, so without this captioned media
@@ -3193,46 +3030,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 	})
 
-	// POST /api/group/share-history
-	//   { "jid": "...@g.us", "participants": ["60123...@s.whatsapp.net"], "count": 50 }
-	// Sends the last `count` group messages to each listed member as a silent
-	// HistorySyncNotification — WhatsApp's "share message history with new member"
-	// mechanism. Nothing is posted into the group; the history surfaces only for
-	// the recipients. Text only; media shows as a "[type]" placeholder.
+	// POST /api/group/share-history — retired. It sent a self-only
+	// HISTORY_SYNC_NOTIFICATION to other users, which WhatsApp answers by
+	// logging the number out (device_removed). Kept as 410 so old callers get
+	// a clear error instead of a 404.
 	apiMux.HandleFunc("/group/share-history", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			JID          string   `json:"jid"`
-			Participants []string `json:"participants"`
-			Count        int      `json:"count"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-		gjid, err := types.ParseJID(req.JID)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid jid: %v", err))
-			return
-		}
-		members, err := parseParticipantJIDs(req.Participants)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if len(members) == 0 {
-			respondError(w, http.StatusBadRequest, "participants is required")
-			return
-		}
-		if err := shareGroupHistory(client, messageStore, gjid, members, req.Count); err != nil {
-			respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to share history: %v", err))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+		respondError(w, http.StatusGone, "history sharing is disabled")
 	})
 
 	apiMux.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {

@@ -115,7 +115,7 @@ func InitMcpTool() {
 
 	mcp.AddTool[addGroupParticipantsInput, any](server, &mcp.Tool{
 		Name:        "add_group_participants",
-		Description: "Add one or more participants (phone numbers, no +) to a WhatsApp group. Returns a per-participant result; an add can fail if the person's privacy settings block direct adds (then 'needs_invite' is set — share the invite link instead). Set share_history=true to silently share recent group messages with the members that were added (so their chat is not empty); share_history_count sets an exact number (1-100) instead of the full recent window.",
+		Description: "Add one or more participants (phone numbers, no +) to a WhatsApp group. Returns a per-participant result; an add can fail if the person's privacy settings block direct adds (then 'needs_invite' is set — share the invite link instead).",
 	}, addGroupParticipantsHandler)
 
 	mcp.AddTool[groupParticipantsInput, any](server, &mcp.Tool{
@@ -267,13 +267,13 @@ type groupParticipantsInput struct {
 	Participants []string `json:"participants" jsonschema:"description:Phone numbers (no +) or member JIDs to act on"`
 }
 
-// add_group_participants extends the shared shape with optional silent
-// history-sharing for the members that get added.
+// add_group_participants keeps the retired history-sharing fields so existing
+// callers still validate; asking for them reports the share as not sent.
 type addGroupParticipantsInput struct {
 	Jid               string   `json:"jid" jsonschema:"description:The group JID like 123@g.us"`
 	Participants      []string `json:"participants" jsonschema:"description:Phone numbers (no +) or member JIDs to add"`
-	ShareHistory      bool     `json:"share_history,omitempty" jsonschema:"description:When true, silently share recent group messages with members that were successfully added so their chat is not empty. Shares as many recent messages as exist, up to WhatsApp's cap of 100. Members that need an invite do not receive it."`
-	ShareHistoryCount int      `json:"share_history_count,omitempty" jsonschema:"description:Exact number of newest messages to share (1-100). Overrides share_history's full-window default and implies sharing is on."`
+	ShareHistory      bool     `json:"share_history,omitempty" jsonschema:"description:Disabled. History sharing on add is not available; setting this only reports history.ok=false."`
+	ShareHistoryCount int      `json:"share_history_count,omitempty" jsonschema:"description:Disabled. History sharing on add is not available; setting this only reports history.ok=false."`
 }
 
 type setGroupNameInput struct {
@@ -1027,11 +1027,6 @@ func doUpdateParticipants(in groupParticipantsInput, action string) (*mcp.CallTo
 	return OkResult(result), nil, nil
 }
 
-// maxShareHistoryCount is WhatsApp's own ceiling for a history-sync share. Used
-// as the window when share_history is on without an explicit count — the bridge
-// then shares however many recent messages there actually are, up to this cap.
-const maxShareHistoryCount = 100
-
 func addGroupParticipantsHandler(ctx context.Context, req *mcp.CallToolRequest, in addGroupParticipantsInput) (*mcp.CallToolResult, any, error) {
 	if in.Jid == "" {
 		return ErrResult("jid is required"), nil, nil
@@ -1052,58 +1047,13 @@ func addGroupParticipantsHandler(ctx context.Context, req *mcp.CallToolRequest, 
 		return ErrResult("invalid update-participants response"), nil, nil
 	}
 
-	// Optionally share recent history with the members that were actually added.
-	// An explicit count wins; otherwise share_history shares the full window and
-	// the bridge sends however many recent messages exist (up to the cap).
-	shareCount := in.ShareHistoryCount
-	if shareCount <= 0 && in.ShareHistory {
-		shareCount = maxShareHistoryCount
-	}
-	if shareCount > maxShareHistoryCount {
-		shareCount = maxShareHistoryCount
-	}
-	if shareCount > 0 {
-		if added := addedParticipantJIDs(result); len(added) > 0 {
-			if _, err := callAPI(http.MethodPost, "/group/share-history", map[string]any{
-				"jid":          in.Jid,
-				"participants": added,
-				"count":        shareCount,
-			}); err != nil {
-				// Don't fail the add if the history share couldn't be sent — surface it.
-				result["history"] = map[string]any{"ok": false, "error": err.Error()}
-			} else {
-				result["history"] = map[string]any{"ok": true, "shared_with": len(added)}
-			}
-		} else {
-			result["history"] = map[string]any{"ok": false, "error": "no members were added"}
-		}
+	// History sharing on add is disabled: the bridge's old share sent a
+	// self-only HISTORY_SYNC_NOTIFICATION to other users, which WhatsApp
+	// answers by logging the number out (device_removed).
+	if in.ShareHistory || in.ShareHistoryCount > 0 {
+		result["history"] = map[string]any{"ok": false, "error": "history sharing is disabled"}
 	}
 	return OkResult(result), nil, nil
-}
-
-// addedParticipantJIDs pulls the JIDs of members that were added successfully
-// (error code 0) from an update-participants response, so we only share history
-// with people who actually joined.
-func addedParticipantJIDs(result map[string]any) []string {
-	rawResults, ok := result["results"].([]any)
-	if !ok {
-		return nil
-	}
-	added := make([]string, 0, len(rawResults))
-	for _, r := range rawResults {
-		entry, ok := r.(map[string]any)
-		if !ok {
-			continue
-		}
-		// JSON numbers decode as float64; 0 = success.
-		if code, ok := entry["error"].(float64); !ok || code != 0 {
-			continue
-		}
-		if jid, ok := entry["jid"].(string); ok && jid != "" {
-			added = append(added, jid)
-		}
-	}
-	return added
 }
 
 func removeGroupParticipantsHandler(ctx context.Context, req *mcp.CallToolRequest, in groupParticipantsInput) (*mcp.CallToolResult, any, error) {
