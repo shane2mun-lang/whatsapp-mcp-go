@@ -1527,7 +1527,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 		// Manager-provided MIME beats the extension guess — critical for
 		// documents, which otherwise default to octet-stream and won't open.
-		if mediaMimetype != "" {
+		// Not for voice notes: callers label .ogg as plain "audio/ogg", and
+		// WhatsApp silently drops a PTT without "codecs=opus".
+		if mediaMimetype != "" && mediaType != whatsmeow.MediaAudio {
 			mimeType = mediaMimetype
 		}
 
@@ -4998,65 +5000,65 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		return 0, nil, fmt.Errorf("not a valid Ogg file (missing OggS signature)")
 	}
 
-	// Parse Ogg pages to find the last page with a valid granule position
-	var lastGranule uint64
-	var sampleRate uint32 = 48000 // Default Opus sample rate
-	var preSkip uint16 = 0
-	var foundOpusHead bool
+	// Opus granule positions always count 48 kHz samples, whatever input rate
+	// OpusHead records. A file can chain several logical streams (TTS output
+	// arrives as concatenated chunks), each restarting its granule at zero, so
+	// sum every stream's final granule rather than trusting the last page.
+	const opusGranuleRate = 48000
+	type oggStream struct {
+		preSkip     uint64
+		lastGranule uint64
+	}
+	streams := map[uint32]*oggStream{}
 
-	for i := 0; i < len(data); {
-		if i+27 >= len(data) {
-			break
-		}
-
+	for i := 0; i+27 <= len(data); {
 		if string(data[i:i+4]) != "OggS" {
 			i++
 			continue
 		}
 
 		granulePos := binary.LittleEndian.Uint64(data[i+6 : i+14])
-		pageSeqNum := binary.LittleEndian.Uint32(data[i+18 : i+22])
+		serial := binary.LittleEndian.Uint32(data[i+14 : i+18])
 		numSegments := int(data[i+26])
-
-		if i+27+numSegments >= len(data) {
+		if i+27+numSegments > len(data) {
 			break
 		}
-		segmentTable := data[i+27 : i+27+numSegments]
-
 		pageSize := 27 + numSegments
-		for _, segLen := range segmentTable {
+		for _, segLen := range data[i+27 : i+27+numSegments] {
 			pageSize += int(segLen)
 		}
-
-		if !foundOpusHead && pageSeqNum <= 1 {
-			pageData := data[i : i+pageSize]
-			headPos := bytes.Index(pageData, []byte("OpusHead"))
-			if headPos >= 0 && headPos+12 < len(pageData) {
-				headPos += 8
-				if headPos+12 <= len(pageData) {
-					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
-					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
-					foundOpusHead = true
-					slog.Info("found OpusHead", "sample_rate", sampleRate, "pre_skip", preSkip)
-				}
-			}
+		if i+pageSize > len(data) {
+			break
 		}
+		payload := data[i+27+numSegments : i+pageSize]
 
-		if granulePos != 0 {
-			lastGranule = granulePos
+		st := streams[serial]
+		if st == nil {
+			st = &oggStream{}
+			streams[serial] = st
+		}
+		// OpusHead: magic(8) version(1) channels(1) pre-skip(2) ...
+		if len(payload) >= 12 && string(payload[:8]) == "OpusHead" {
+			st.preSkip = uint64(binary.LittleEndian.Uint16(payload[10:12]))
+		}
+		// -1 marks a page on which no packet finishes; it carries no position.
+		if granulePos != 0 && granulePos != math.MaxUint64 {
+			st.lastGranule = granulePos
 		}
 
 		i += pageSize
 	}
 
-	if !foundOpusHead {
-		slog.Warn("opushead not found, using default values")
+	var totalSamples uint64
+	for _, st := range streams {
+		if st.lastGranule > st.preSkip {
+			totalSamples += st.lastGranule - st.preSkip
+		}
 	}
 
-	if lastGranule > 0 {
-		durationSeconds := float64(lastGranule-uint64(preSkip)) / float64(sampleRate)
-		duration = uint32(math.Ceil(durationSeconds))
-		slog.Info("calculated Opus duration from granule", "duration_seconds", durationSeconds, "last_granule", lastGranule)
+	if totalSamples > 0 {
+		duration = uint32(min((totalSamples+opusGranuleRate-1)/opusGranuleRate, math.MaxUint32))
+		slog.Info("calculated Opus duration from granule", "duration_seconds", float64(totalSamples)/opusGranuleRate, "streams", len(streams))
 	} else {
 		slog.Warn("no valid granule position found, using estimation")
 		durationEstimate := float64(len(data)) / 2000.0
