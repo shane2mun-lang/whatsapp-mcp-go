@@ -1912,15 +1912,26 @@ func quotedFromMessage(m *waE2E.Message) (quotedID, quotedSender, quotedContent 
 // buildWebhookPayload produces a full-fidelity payload for an incoming message.
 // Friendly fields cover the common types; "raw" carries the complete decoded
 // message so nothing is ever lost, including types not mapped explicitly.
-func buildWebhookPayload(client *whatsmeow.Client, evt *events.Message) map[string]interface{} {
+//
+// storedChatJID is the chat the message was stored under (handleMessage
+// normalizes a 1:1 LID chat to its phone JID). chat_jid must be that key, not
+// evt.Info.Chat: a consumer that looks the message up again — media download,
+// history export — has to name the same chat the store does. Sending the raw
+// LID instead split ~50k messages in whatsapp-manager-go across two chat keys
+// and made every media download for them miss (Oct 2026). The raw LID still
+// rides along as chat_lid for consumers that keyed on it.
+func buildWebhookPayload(client *whatsmeow.Client, evt *events.Message, storedChatJID string) map[string]interface{} {
 	p := map[string]interface{}{
-		"chat_jid":   evt.Info.Chat.String(),
+		"chat_jid":   storedChatJID,
 		"sender":     normalizeUserJID(client, evt.Info.Sender).User,
 		"is_from_me": evt.Info.IsFromMe,
 		"timestamp":  evt.Info.Timestamp.String(),
 		"push_name":  evt.Info.PushName,
 		"is_group":   evt.Info.IsGroup,
 		"message_id": evt.Info.ID,
+	}
+	if raw := evt.Info.Chat.String(); raw != storedChatJID {
+		p["chat_lid"] = raw
 	}
 
 	m := unwrapMessage(evt.Message)
@@ -2312,7 +2323,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			return
 		}
 
-		payload := buildWebhookPayload(client, msg)
+		payload := buildWebhookPayload(client, msg, chatJID)
 
 		jsonData, err := json.Marshal(payload)
 		if err != nil {
